@@ -1,0 +1,651 @@
+
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import * as pdfjsLib from "pdfjs-dist";
+import { ArrowDownToLine, ZoomIn, ZoomOut, X, Loader2 } from "lucide-react";
+import Spinner from "../loading-animation/spinner";
+
+if (typeof window !== "undefined") {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/5.4.54/pdf.worker.min.mjs`;
+}
+
+interface PdfOverlayViewerProps {
+  file: File | string | null;
+  fileName?: string | null;
+  onClose: () => void;
+}
+
+const IconButton = ({
+  Icon,
+  alt,
+  onClick,
+  className,
+}: {
+  Icon: React.ComponentType<{ className?: string }>;
+  alt: string;
+  onClick?: () => void;
+  className?: string;
+}) => (
+  <button
+    type="button"
+    onClick={onClick}
+    className="group relative inline-flex items-center justify-center rounded cursor-pointer w-[3.6rem] h-[2.8rem]"
+    aria-label={alt}
+    title={alt}
+  >
+    <Icon className="w-[1.6rem] h-[1.6rem] hover:text-white text-[#E5E7EB] group-hover:text-white" />
+  </button>
+);
+
+const PdfOverlayViewer = ({
+  file,
+  fileName,
+  onClose,
+}: PdfOverlayViewerProps) => {
+  const [pdfDoc, setPdfDoc] = useState<any>(null);
+  const [numPages, setNumPages] = useState(0);
+  const [scale, setScale] = useState(1.2);
+  const [canvases, setCanvases] = useState<HTMLCanvasElement[]>([]);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [isPdfFile, setIsPdfFile] = useState(true);
+  const [outline, setOutline] = useState<any[]>([]);
+  const [pageCanvases, setPageCanvases] = useState<HTMLCanvasElement[]>([]);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const [isRendering, setIsRendering] = useState(false);
+  const [loadedPages, setLoadedPages] = useState(0);
+
+  // Progressive render of pages
+  const renderAllPages = async () => {
+    if (!pdfDoc || numPages === 0) return;
+
+    setIsRendering(true);
+    setLoadedPages(0);
+    setCanvases([]);
+    setPageCanvases([]);
+
+    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+      try {
+        const page = await pdfDoc.getPage(pageNum);
+
+        // ---- Main Page ----
+        const viewport = page.getViewport({ scale });
+        const mainCanvas = document.createElement("canvas");
+        const mainCtx = mainCanvas.getContext("2d");
+        if (!mainCtx) continue;
+        mainCanvas.height = viewport.height;
+        mainCanvas.width = viewport.width;
+
+        await page.render({ canvasContext: mainCtx, viewport }).promise;
+
+        // Add page immediately as it loads
+        setCanvases((prev) => [...prev, mainCanvas]);
+
+        // ---- Thumbnail Preview ----
+        const previewViewport = page.getViewport({ scale: 0.4 });
+        const previewCanvas = document.createElement("canvas");
+        const previewCtx = previewCanvas.getContext("2d");
+        if (!previewCtx) continue;
+        previewCanvas.height = previewViewport.height;
+        previewCanvas.width = previewViewport.width;
+
+        await page.render({
+          canvasContext: previewCtx,
+          viewport: previewViewport,
+        }).promise;
+
+        setPageCanvases((prev) => [...prev, previewCanvas]);
+        setLoadedPages(pageNum);
+      } catch (error) {
+        console.error(`Error rendering page ${pageNum}:`, error);
+      }
+    }
+
+    setIsRendering(false);
+  };
+
+  // Re-render pages with new scale
+  const reRenderWithScale = async () => {
+    if (!pdfDoc || numPages === 0) return;
+
+    setIsRendering(true);
+    const container = containerRef.current;
+    const scrollPercentage = container
+      ? container.scrollTop / (container.scrollHeight - container.clientHeight)
+      : 0;
+
+    const newMainCanvases: HTMLCanvasElement[] = [];
+
+    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+      try {
+        const page = await pdfDoc.getPage(pageNum);
+        const viewport = page.getViewport({ scale });
+        const mainCanvas = document.createElement("canvas");
+        const mainCtx = mainCanvas.getContext("2d");
+        if (!mainCtx) continue;
+        mainCanvas.height = viewport.height;
+        mainCanvas.width = viewport.width;
+
+        await page.render({ canvasContext: mainCtx, viewport }).promise;
+        newMainCanvases.push(mainCanvas);
+      } catch (error) {
+        console.error(`Error rendering page ${pageNum}:`, error);
+      }
+    }
+
+    setCanvases(newMainCanvases);
+    setIsRendering(false);
+
+    // Restore scroll position
+    requestAnimationFrame(() => {
+      if (container && scrollPercentage > 0) {
+        const newScrollTop =
+          scrollPercentage * (container.scrollHeight - container.clientHeight);
+        container.scrollTop = newScrollTop;
+      }
+    });
+  };
+
+  // Load PDF document when file changes
+  useEffect(() => {
+    if (!file) {
+      // If no file but fileName exists, show loading state
+      if (fileName) {
+        setLoading(true);
+        setError(null);
+        const checkIsPdf = () => {
+          return fileName.toLowerCase().endsWith(".pdf");
+        };
+        setIsPdfFile(checkIsPdf());
+      }
+      return;
+    }
+
+    // Check if file is PDF
+    const checkIsPdf = () => {
+      if (fileName) {
+        return fileName.toLowerCase().endsWith(".pdf");
+      }
+      if (typeof file === "string") {
+        return (
+          file.toLowerCase().includes(".pdf") ||
+          file.includes("application/pdf")
+        );
+      }
+      return (
+        file.type === "application/pdf" ||
+        file.name?.toLowerCase().endsWith(".pdf")
+      );
+    };
+
+    const isPdf = checkIsPdf();
+    setIsPdfFile(isPdf);
+
+    if (!isPdf) {
+      setLoading(false);
+      return;
+    }
+
+    const loadPdf = async () => {
+      try {
+        setLoading(true);
+        setError(null);
+        let data: any;
+        if (typeof file === "string") {
+          data = file;
+        } else {
+          data = await file.arrayBuffer();
+        }
+        const loadingTask = pdfjsLib.getDocument(data);
+        const pdf = await loadingTask.promise;
+        setPdfDoc(pdf);
+        setNumPages(pdf.numPages);
+
+        // Extract outline/bookmarks
+        try {
+          const pdfOutline = await pdf.getOutline();
+          if (pdfOutline) {
+            setOutline(pdfOutline);
+          }
+        } catch (err) {
+          console.error("No outline available");
+        }
+
+        setLoading(false);
+      } catch (err: any) {
+        console.error("Error loading PDF:", err);
+        setError(`Failed to load PDF: ${err.message}`);
+        setLoading(false);
+      }
+    };
+
+    loadPdf();
+  }, [file, fileName]);
+
+  // Initial render when PDF loads
+  useEffect(() => {
+    if (pdfDoc && numPages > 0) {
+      renderAllPages();
+      generatePagePreviews();
+    }
+  }, [pdfDoc, numPages]);
+
+  // Re-render when scale changes
+  useEffect(() => {
+    if (pdfDoc && numPages > 0 && canvases.length > 0) {
+      reRenderWithScale();
+    }
+  }, [scale]);
+
+  // Handle scroll and zoom events
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || canvases.length === 0) return;
+
+    const handleScroll = () => {
+      const containerTop = container.scrollTop;
+      const containerHeight = container.clientHeight;
+      const centerY = containerTop + containerHeight / 2;
+
+      let currentPageIndex = 0;
+      let accumulatedHeight = 0;
+
+      for (let i = 0; i < canvases.length; i++) {
+        const canvasHeight = canvases[i].height + 10;
+        if (centerY <= accumulatedHeight + canvasHeight) {
+          currentPageIndex = i;
+          break;
+        }
+        accumulatedHeight += canvasHeight;
+      }
+      const newPage = currentPageIndex + 1;
+      setCurrentPage(newPage);
+
+      // Auto-scroll sidebar to show active page
+      const sidebar = sidebarRef.current;
+      if (sidebar) {
+        const activePageElement = sidebar.querySelector(
+          `[data-page="${newPage}"]`
+        );
+        if (activePageElement) {
+          activePageElement.scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
+        }
+      }
+    };
+    // Wheel events for zooming
+    const handleWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        e.preventDefault();
+        const delta = (e.deltaY / 300) * -1; // Increased sensitivity from 1000 to 300
+        setScale((s) => Math.max(0.6, Math.min(3, s + delta)));
+      }
+    };
+
+    // Touch events for touchpad pinch-to-zoom
+    let initialDistance = 0;
+    let initialScale = scale;
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const touch1 = e.touches[0];
+        const touch2 = e.touches[1];
+        initialDistance = Math.hypot(
+          touch2.clientX - touch1.clientX,
+          touch2.clientY - touch1.clientY
+        );
+        initialScale = scale;
+      }
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const touch1 = e.touches[0];
+        const touch2 = e.touches[1];
+        const currentDistance = Math.hypot(
+          touch2.clientX - touch1.clientX,
+          touch2.clientY - touch1.clientY
+        );
+
+        if (initialDistance > 0) {
+          const scaleChange = currentDistance / initialDistance;
+          // Amplify the scale change for faster zoom
+          const amplifiedChange = Math.pow(scaleChange, 0.7); // Makes zoom more responsive
+          const newScale = Math.max(
+            0.6,
+            Math.min(3, initialScale * amplifiedChange)
+          );
+          setScale(newScale);
+        }
+      }
+    };
+
+    const handleTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2) {
+        initialDistance = 0;
+      }
+    };
+
+    container.addEventListener("scroll", handleScroll);
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    container.addEventListener("touchstart", handleTouchStart, {
+      passive: false,
+    });
+    container.addEventListener("touchmove", handleTouchMove, {
+      passive: false,
+    });
+    container.addEventListener("touchend", handleTouchEnd, { passive: false });
+    handleScroll();
+
+    return () => {
+      container.removeEventListener("scroll", handleScroll);
+      container.removeEventListener("wheel", handleWheel);
+      container.removeEventListener("touchstart", handleTouchStart);
+      container.removeEventListener("touchmove", handleTouchMove);
+      container.removeEventListener("touchend", handleTouchEnd);
+    };
+  }, [canvases, scale]);
+  // Handle download of file
+  const handleDownload = () => {
+    if (!file) return;
+    const link = document.createElement("a");
+    link.href = typeof file === "string" ? file : URL.createObjectURL(file);
+    link.download =
+      fileName || (typeof file === "string" ? "document" : file.name);
+    link.click();
+  };
+  // Scroll to specific page in PDF
+  const scrollToPage = (pageNum: number) => {
+    const container = containerRef.current;
+    if (!container || canvases.length === 0) return;
+
+    const targetCanvas = canvases[pageNum - 1];
+    if (!targetCanvas) return;
+
+    const canvasElements = container.querySelectorAll("canvas");
+    const targetElement = Array.from(canvasElements).find(
+      (canvas) => canvas === targetCanvas
+    );
+
+    if (targetElement) {
+      targetElement.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  };
+  // Generate page previews for the sidebar (not used anymore as previews are generated in renderAllPages)
+  const generatePagePreviews = async () => {
+    // This function is now handled within renderAllPages for progressive loading
+  };
+  // Render outline items recursively
+  const renderOutlineItem = (item: any, level = 0) => {
+    const pageNum = item.dest
+      ? Array.isArray(item.dest)
+        ? item.dest[0]
+        : item.dest
+      : null;
+
+    return (
+      <div key={item.title + level} className={`ml-${level * 4}`}>
+        <div
+          className="py-1 px-2 text-xs cursor-pointer hover:bg-blue-100 rounded"
+          onClick={() => pageNum && scrollToPage(pageNum)}
+        >
+          {item.title}
+        </div>
+        {item.items &&
+          item.items.map((subItem: any) =>
+            renderOutlineItem(subItem, level + 1)
+          )}
+      </div>
+    );
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-2 sm:p-4"
+      onClick={onClose}
+    >
+      {/* Overlay container */}
+      <div
+        className="flex flex-col justify-between items-start overflow-hidden w-full h-full max-w-[95vw] max-h-[95vh] sm:max-w-[90vw] sm:max-h-[90vh] lg:w-[121.0rem] lg:h-[73.6rem]"
+        style={{
+          borderRadius: "0.75rem",
+          border: "1px solid #777777",
+          background: "rgba(0, 0, 0, 0.1)",
+          boxShadow: "0 4px 15px 0 rgba(0, 0, 0, 0.15)",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Top bar or header - Fixed/Sticky */}
+        <div
+          className="w-full flex justify-between items-center  px-2 py-[1.2rem] sm:px-4 lg:px-[0.625rem] lg:py-[1.2rem] sticky top-0 z-10"
+          style={{
+            background: "!rgba(255, 255, 255, 0.05)",
+            backdropFilter: "!blur(10px)",
+          }}
+        >
+          <div
+            className=" text-white !truncate max-w-[20rem]"
+            title={fileName || "File"}
+          >
+            {fileName}
+          </div>
+
+          <div className="flex items-center gap-4">
+            <span
+              className="text-[1.4rem] text-white font-bold font-inter max-w-[20rem] truncate overflow-hidden whitespace-nowrap "
+              title={fileName || "File"}
+            >
+              {loading
+                ? "Loading..."
+                : isPdfFile
+                ? isRendering && loadedPages < numPages
+                  ? `Loading ${loadedPages}/${numPages} pages...`
+                  : `${currentPage} of ${numPages}`
+                : fileName || "File"}{" "}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-[1rem] sm:h-[3.1rem] justify-end ">
+            {/* Download*/}
+            <IconButton
+              Icon={ArrowDownToLine}
+              alt=""
+              onClick={handleDownload}
+            />
+            {/* Show Zoom buttons only for PDF files */}
+            {isPdfFile && (
+              <>
+                {/* Zoom In */}
+                <IconButton
+                  Icon={ZoomIn}
+                  alt="Zoom In"
+                  onClick={() => setScale((s) => Math.min(3, s + 0.2))}
+                />
+                {/* Zoom Out */}
+                <IconButton
+                  Icon={ZoomOut}
+                  alt="Zoom Out"
+                  onClick={() => setScale((s) => Math.max(0.6, s - 0.2))}
+                />
+              </>
+            )}
+
+            {/* Close button*/}
+            <button
+              type="button"
+              onClick={onClose}
+              className="inline-flex items-center justify-center rounded cursor-pointer w-[4.6rem] h-[3rem]"
+              aria-label="Close"
+              title="Close"
+            >
+              <X
+                width={14}
+                height={14}
+                className="w-[1.4rem] h-[1.4rem] sm:w-[1.4rem] sm:h-[1.4rem] lg:h-[1.4rem] lg:w-[1.4rem] xl:h-[1.4rem] xl:w-[1.4rem] text-[#E5E7EB] hover:text-white"
+              />
+            </button>
+          </div>
+        </div>
+
+        {/* Main content area with sidebar and PDF */}
+        <div className="flex-1 w-full flex overflow-hidden">
+          {/* Table of Contents Sidebar - Only show for PDF files when not loading */}
+          {!loading && isPdfFile && (
+            <div
+              ref={sidebarRef}
+              className="w-64 bg-black/0 border-r border-[#777777] overflow-y-auto p-1 !text-white"
+            >
+              <h3 className="text-sm font-semibold mb-3 text-white-800">
+                Table of Contents
+              </h3>
+              <div className="space-y-1">
+                {Array.from({ length: numPages }, (_, i) => (
+                  <div
+                    key={i + 1}
+                    data-page={i + 1}
+                    className={`flex flex-col items-center gap-[0.2rem] mb-[1rem]  px-[1rem] text-xs cursor-pointer rounded ${
+                      currentPage === i + 1 ? "" : ""
+                    }`}
+                    onClick={() => pageCanvases[i] && scrollToPage(i + 1)}
+                  >
+                    {pageCanvases[i] ? (
+                      <div
+                        className={`border flex-shrink-0  hover:border-blue-400 ${
+                          currentPage === i + 1
+                            ? "border-blue-400 border-3"
+                            : "border-gray-200"
+                        }`}
+                        ref={(el) => {
+                          if (
+                            el &&
+                            pageCanvases[i] &&
+                            !el.contains(pageCanvases[i])
+                          ) {
+                            el.innerHTML = "";
+                            pageCanvases[i].style.width = "100%";
+                            pageCanvases[i].style.height = "auto";
+                            pageCanvases[i].style.objectFit = "contain";
+                            el.appendChild(pageCanvases[i]);
+                          }
+                        }}
+                      />
+                    ) : i < loadedPages ? (
+                      //Placeholder for loading state
+                      <div className="border border-gray-200 flex-shrink-0 w-full h-20 flex items-center justify-center bg-gray-50">
+                        <Spinner />
+                      </div>
+                    ) : (
+                      //Placeholder for not yet loaded pages
+                      <div className="border border-gray-200 flex-shrink-0 w-full h-20 flex items-center justify-center bg-gray-100">
+                        <Loader2 className="w-2 h-2 animate-spin text-gray-500" />
+                      </div>
+                    )}
+                    <span className="text-white-600">Page {i + 1}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* PDF Content container  */}
+          <div
+            ref={containerRef}
+            className="flex-1 overflow-y-auto overflow-x-hidden flex flex-col items-center p-[0.125rem] sm:p-[0.25rem]"
+            style={{ backgroundColor: "rgba(249, 250, 251, 0.7)" }}
+          >
+            {/* Loading and Error States */}
+            {loading && (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center text-white">
+                  <Spinner />
+                  <p className="mt-2">Loading file...</p>
+                </div>
+              </div>
+            )}
+
+            {/* Show loading indicator for remaining pages */}
+            {!loading &&
+              isRendering &&
+              loadedPages < numPages &&
+              canvases.length > 0 && (
+                <div className="flex items-center justify-center py-4">
+                  <div className="text-center">
+                    <Spinner />
+                    <p className="text-gray-600 mt-2">
+                      Loading page {loadedPages + 1} of {numPages}...
+                    </p>
+                  </div>
+                </div>
+              )}
+
+            {error && (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center text-red-600">
+                  <p className="mb-2">Error loading PDF</p>
+                  <p className="text-sm">{error}</p>
+                </div>
+              </div>
+            )}
+
+            {/* Non-PDF file fallback  */}
+            {!loading && !error && !isPdfFile && (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center">
+                  <p className="text-gray-600 text-lg mb-4">
+                    No preview available,&nbsp;
+                    <a
+                      href={
+                        !file
+                          ? undefined
+                          : typeof file === "string"
+                          ? file
+                          : URL.createObjectURL(file)
+                      }
+                      download={
+                        fileName ||
+                        (file && typeof file !== "string"
+                          ? file.name
+                          : "document")
+                      }
+                      className={`text-primary hover:underline ${
+                        !file ? "pointer-events-none opacity-50" : ""
+                      }`}
+                    >
+                      Download file.{" "}
+                    </a>
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* PDF content - Show pages as they load */}
+            {!loading &&
+              !error &&
+              isPdfFile &&
+              canvases.map((canvas, index) => (
+                <div
+                  key={index}
+                  className="flex justify-center w-full mb-[0.25rem] last:mb-0"
+                  ref={(el) => {
+                    if (el && canvas && !el.contains(canvas)) {
+                      el.innerHTML = "";
+                      el.appendChild(canvas);
+                    }
+                  }}
+                />
+              ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default PdfOverlayViewer;
